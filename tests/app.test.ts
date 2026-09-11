@@ -131,4 +131,66 @@ describe('registration API', () => {
     expect(response.status).toBe(404);
     expect(response.body.error.code).toBe('USER_NOT_FOUND');
   });
+
+  it('rejects registration on a cancelled event', async () => {
+    const response = await request(app)
+      .post(`/events/${SEED_EVENT_IDS.cancelled}/registrations`)
+      .send({ userId: seedUserId(1) });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error.code).toBe('EVENT_CANCELLED');
+  });
+});
+
+describe('concurrent registration', () => {
+  it('does not exceed capacity under parallel requests', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        request(app)
+          .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
+          .send({ userId: seedUserId(i + 1) }),
+      ),
+    );
+
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    expect(statuses.filter((s) => s === 409)).toHaveLength(19);
+    expect(await Registration.count()).toBe(1);
+  });
+
+  it('returns the same registration for parallel duplicate requests', async () => {
+    const sameUser = seedUserId(1);
+
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        request(app)
+          .post(`/events/${SEED_EVENT_IDS.main}/registrations`)
+          .send({ userId: sameUser }),
+      ),
+    );
+
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    expect(statuses.filter((s) => s === 200)).toHaveLength(19);
+
+    const ids = results
+      .filter((r) => r.status === 200 || r.status === 201)
+      .map((r) => r.body.registration.id);
+    expect(new Set(ids).size).toBe(1);
+    expect(await Registration.count()).toBe(1);
+  });
+
+  it('never returns 500 under parallel requests', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        request(app)
+          .post(`/events/${SEED_EVENT_IDS.singleSeat}/registrations`)
+          .send({ userId: seedUserId(i + 1) }),
+      ),
+    );
+
+    for (const r of results) {
+      expect(r.status).not.toBe(500);
+    }
+  });
 });

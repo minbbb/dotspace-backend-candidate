@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from 'express';
-import { Event, Registration, User } from '../models';
+import { UniqueConstraintError } from 'sequelize';
+import { Event, Registration, sequelize, User } from '../models';
 
 function registrationJson(registration: Registration) {
   return {
@@ -19,22 +20,6 @@ export async function registerForEvent(
     const eventId = req.params.eventId as string;
     const { userId } = req.body as { userId?: string };
 
-    const event = await Event.findByPk(eventId);
-    if (!event) {
-      res.status(404).json({
-        error: { code: 'EVENT_NOT_FOUND', message: 'Event was not found' },
-      });
-      return;
-    }
-
-    const registrationsNow = await Registration.count({ where: { eventId } });
-    if (registrationsNow >= event.capacity) {
-      res.status(409).json({
-        error: { code: 'EVENT_FULL', message: 'There are no free places' },
-      });
-      return;
-    }
-
     const user = await User.findByPk(userId);
     if (!user) {
       res.status(404).json({
@@ -43,25 +28,43 @@ export async function registerForEvent(
       return;
     }
 
-    const sameRegistration = await Registration.findOne({
-      where: { eventId, userId: user.id },
-    });
+    try {
+      const result = await sequelize.transaction(async (t) => {
+        const event = await Event.findByPk(eventId, { lock: true, transaction: t });
+        if (!event) {
+          return { status: 404 as const, body: { error: { code: 'EVENT_NOT_FOUND', message: 'Event was not found' } } };
+        }
 
-    if (sameRegistration) {
-      res.status(200).json({
-        registration: {
-          id: sameRegistration.id,
-          eventId: sameRegistration.eventId,
-          userId: sameRegistration.userId,
-          createdAt: sameRegistration.createdAt,
-        },
+        if (event.status !== 'OPEN') {
+          return { status: 409 as const, body: { error: { code: 'EVENT_CANCELLED', message: 'Event is cancelled' } } };
+        }
+
+        const registrationsNow = await Registration.count({ where: { eventId }, transaction: t });
+        if (registrationsNow >= event.capacity) {
+          return { status: 409 as const, body: { error: { code: 'EVENT_FULL', message: 'There are no free places' } } };
+        }
+
+        const sameRegistration = await Registration.findOne({
+          where: { eventId, userId: user.id },
+          transaction: t,
+        });
+        if (sameRegistration) {
+          return { status: 200 as const, body: { registration: registrationJson(sameRegistration) } };
+        }
+
+        const created = await Registration.create({ eventId, userId: user.id }, { transaction: t });
+        return { status: 201 as const, body: { registration: registrationJson(created) } };
       });
-      return;
+
+      res.status(result.status).json(result.body);
+    } catch (error) {
+      if (error instanceof UniqueConstraintError) {
+        const existing = await Registration.findOne({ where: { eventId, userId: user.id } });
+        res.status(200).json({ registration: registrationJson(existing!) });
+        return;
+      }
+      throw error;
     }
-
-    const created = await Registration.create({ eventId, userId: user.id });
-
-    res.status(201).json({ registration: registrationJson(created) });
   } catch (error) {
     next(error);
   }
